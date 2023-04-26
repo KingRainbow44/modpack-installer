@@ -17,7 +17,9 @@ pub struct ModrinthModInfo {
 #[derive(Clone, Deserialize)]
 pub struct ModrinthModVersion {
     files: Vec<ModrinthFile>,
-    dependencies: Vec<ModrinthDependency>
+    dependencies: Vec<ModrinthDependency>,
+    game_versions: Vec<String>,
+    loaders: Vec<String>
 }
 
 #[derive(Clone, Deserialize)]
@@ -45,16 +47,27 @@ fn version_info(_mod: ModrinthModInfo, version: String) -> String {
 }
 
 /// Picks the correct version from the mod's versions.
-fn pick_version(version: String, _mod: ModrinthModInfo) -> String {
+async fn pick_version(version: String, _mod: ModrinthModInfo) -> ModrinthModVersion {
+    let mut version = ModrinthModVersion {
+        files: vec![], dependencies: vec![],
+        game_versions: vec![], loaders: vec![]
+    };
+
     // Iterate through the game versions.
-    for (i, v) in _mod.game_versions.iter().enumerate() {
-        // Check if the version matches.
-        if v == &version {
-            return _mod.versions[i].clone();
+    for (i, v) in _mod.versions.iter().enumerate() {
+        // Query the version data.
+        version = serde_json::from_str(reqwest::get(
+            version_info(_mod.clone(), v.clone())
+        ).await.unwrap().text().await.unwrap().as_str()).unwrap();
+
+        // Check if the version is compatible.
+        if version.game_versions.contains(&version.clone().game_versions[i]) &&
+            version.loaders.contains(&"fabric".to_string()) {
+            break;
         }
     }
 
-    String::new() // Fallback to an empty string.
+    version
 }
 
 /// Saves the mod's version to the file system.
@@ -85,10 +98,8 @@ async fn download_unsafe(target: Target, _mod: String) -> Result<(), reqwest::Er
     ).await?.text().await?.as_str()).unwrap();
 
     // Get the matching version.
-    let version = pick_version(target.clone().target_version, mod_info.clone());
-    let version_info: ModrinthModVersion = serde_json::from_str(reqwest::get(
-        version_info(mod_info.clone(), version)
-    ).await?.text().await?.as_str()).unwrap();
+    let version_info = pick_version(
+        target.clone().target_version, mod_info.clone()).await;
 
     // Save the version to the file system.
     Ok(save_version(target.clone(), version_info).await?)
@@ -103,10 +114,8 @@ pub async fn download(target: Target, _mod: String, is_server: bool) -> Result<b
     ).await?.text().await?.as_str()).unwrap();
 
     // Get the matching version.
-    let version = pick_version(target.clone().target_version, mod_info.clone());
-    let version_info: ModrinthModVersion = serde_json::from_str(reqwest::get(
-        version_info(mod_info.clone(), version)
-    ).await?.text().await?.as_str()).unwrap();
+    let version_info = pick_version(
+        target.clone().target_version, mod_info.clone()).await;
 
     // Check if the mod is supported.
     if is_server {
