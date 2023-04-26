@@ -1,7 +1,7 @@
 use serde::{Deserialize};
 use tokio::fs;
 
-use crate::Target;
+use crate::{files, Target};
 
 const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 
@@ -16,6 +16,7 @@ pub struct ModrinthModInfo {
 
 #[derive(Clone, Deserialize)]
 pub struct ModrinthModVersion {
+    project_id: String,
     files: Vec<ModrinthFile>,
     dependencies: Vec<ModrinthDependency>,
     game_versions: Vec<String>,
@@ -47,7 +48,7 @@ fn version_info(_mod: ModrinthModInfo, version: String) -> String {
 }
 
 /// Picks the correct version from the mod's versions.
-async fn pick_version(version: String, _mod: ModrinthModInfo) -> ModrinthModVersion {
+async fn pick_version(game_ver: String, _mod: ModrinthModInfo) -> ModrinthModVersion {
     let mut version = ModrinthModVersion {
         files: vec![], dependencies: vec![],
         game_versions: vec![], loaders: vec![]
@@ -61,7 +62,7 @@ async fn pick_version(version: String, _mod: ModrinthModInfo) -> ModrinthModVers
         ).await.unwrap().text().await.unwrap().as_str()).unwrap();
 
         // Check if the version is compatible.
-        if version.game_versions.contains(&version.clone().game_versions[i]) &&
+        if version.game_versions.contains(&game_ver) &&
             version.loaders.contains(&"fabric".to_string()) {
             break;
         }
@@ -72,6 +73,12 @@ async fn pick_version(version: String, _mod: ModrinthModInfo) -> ModrinthModVers
 
 /// Saves the mod's version to the file system.
 async fn save_version(target: Target, version: ModrinthModVersion) -> Result<(), reqwest::Error> {
+    // Check if the mod doesn't exist.
+    if version.files.len() < 1 {
+        println!("Skipped {}.", version.project_id);
+        return Ok(());
+    }
+
     // Get the URL & file name for the mod.
     let url = &version.files[0].url;
     let file_name = &version.files[0].filename;
@@ -79,6 +86,11 @@ async fn save_version(target: Target, version: ModrinthModVersion) -> Result<(),
     let file_name = percent_encoding::percent_decode_str(file_name)
         .decode_utf8().unwrap();
     let path = format!("{}/mods/{}", target.clone().file_path, file_name);
+
+    // Check if the file already exists.
+    if files::exists(path.clone().as_str()).await {
+        return Ok(());
+    }
 
     // Download the mod.
     let bytes = reqwest::get(url).await?.bytes().await?;
