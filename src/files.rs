@@ -1,6 +1,9 @@
 use std::env::var_os;
+use std::fs::File;
 use std::path::PathBuf;
+use reqwest::header::USER_AGENT;
 use tokio::fs;
+use crate::{CLIENT, DEFAULT_AGENT};
 
 /// Checks if the file exists on the file system.
 pub async fn exists(path: &str) -> bool {
@@ -15,6 +18,11 @@ pub async fn read(path: &str) -> String {
 /// Writes the file to the file system.
 pub async fn write(path: &str, content: String) {
     fs::write(path, content).await.unwrap();
+}
+
+/// Deletes the file from the file system.
+pub async fn delete(path: &str) {
+    fs::remove_file(path).await.unwrap();
 }
 
 /// Creates a directory on the file system.
@@ -40,11 +48,18 @@ pub fn get_temp() -> Option<PathBuf> {
 /// Downloads a file from the internet.
 /// Saves the file to the file system.
 pub async fn download(url: String, path: String) -> Result<(), reqwest::Error> {
-    let bytes = reqwest::get(url).await?.bytes().await?;
+    let bytes = CLIENT.get(url).header(USER_AGENT, DEFAULT_AGENT.clone())
+        .send().await?.bytes().await?;
     Ok(fs::write(path, bytes).await.unwrap())
 }
 
 /// Checks if the URL is valid.
 pub fn is_url(url: String) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Extracts an archive to the file system.
+pub fn extract_archive(archive: String, destination: String) {
+    let file = File::open(archive).unwrap();
+    zip_extract::extract(file, destination.as_ref(), true).unwrap();
 }

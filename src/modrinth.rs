@@ -1,22 +1,25 @@
+use async_recursion::async_recursion;
+use reqwest::header::USER_AGENT;
 use serde::{Deserialize};
 use tokio::fs;
+use tokio::time::Duration;
 
-use crate::{files, Target};
+use crate::{CLIENT, DEFAULT_AGENT, files, Target};
 
 const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 
 #[derive(Clone, Deserialize)]
 pub struct ModrinthModInfo {
     id: String,
+    title: String,
     client_side: String,
     server_side: String,
-    game_versions: Vec<String>,
     versions: Vec<String>
 }
 
 #[derive(Clone, Deserialize)]
 pub struct ModrinthModVersion {
-    project_id: String,
+    project_id: Option<String>,
     files: Vec<ModrinthFile>,
     dependencies: Vec<ModrinthDependency>,
     game_versions: Vec<String>,
@@ -47,19 +50,58 @@ fn version_info(_mod: ModrinthModInfo, version: String) -> String {
     format!("{}/project/{}/version/{}", MODRINTH_API, _mod.id, version)
 }
 
+/// Performs a request to the Modrinth API.
+/// Handles the rate limit system implemented.
+#[async_recursion]
+async fn make_request(url: String) -> Result<String, reqwest::Error> {
+    let response = CLIENT.get(url.clone())
+        .header(USER_AGENT, DEFAULT_AGENT.clone())
+        .send().await?;
+
+    // Check if the request was successful.
+    if response.status().eq(&429) {
+        // Get the 'X-Ratelimit-Reset' header.
+        let reset = response.headers().get("X-Ratelimit-Reset")
+            .unwrap().to_str().unwrap().parse::<u64>().unwrap() + 1;
+
+        println!("Hit a rate limit; waiting {}s...", reset);
+
+        // Wait 1 minute before making requests again.
+        tokio::time::sleep(Duration::from_secs(reset)).await;
+        println!("Retrying {}...", url);
+
+        return make_request(url).await;
+    }
+
+    // Return the response.
+    Ok(response.text().await.unwrap())
+}
+
 /// Picks the correct version from the mod's versions.
-async fn pick_version(game_ver: String, _mod: ModrinthModInfo) -> ModrinthModVersion {
+async fn pick_version(game_ver: String, mut _mod: ModrinthModInfo) -> ModrinthModVersion {
     let mut version = ModrinthModVersion {
         files: vec![], dependencies: vec![],
-        game_versions: vec![], loaders: vec![]
+        game_versions: vec![], loaders: vec![],
+        project_id: None
     };
 
+    // Get the mod's versions.
+    let mut versions = _mod.clone().versions;
+    versions.reverse(); // Reversing increases the chance of finding a compatible version.
+
     // Iterate through the game versions.
-    for (i, v) in _mod.versions.iter().enumerate() {
+    for (_, ver) in versions.iter().enumerate() {
         // Query the version data.
-        version = serde_json::from_str(reqwest::get(
-            version_info(_mod.clone(), v.clone())
-        ).await.unwrap().text().await.unwrap().as_str()).unwrap();
+        version = serde_json::from_str(make_request(
+            version_info(_mod.clone(), ver.clone())
+        ).await.unwrap().as_str()).unwrap_or_else(|error| {
+            println!("Unable to download {} ({}). Error: {}", _mod.clone().title, _mod.clone().id, error);
+            ModrinthModVersion {
+                files: vec![], dependencies: vec![],
+                game_versions: vec![], loaders: vec![],
+                project_id: None
+            }
+        });
 
         // Check if the version is compatible.
         if version.game_versions.contains(&game_ver) &&
@@ -72,10 +114,10 @@ async fn pick_version(game_ver: String, _mod: ModrinthModInfo) -> ModrinthModVer
 }
 
 /// Saves the mod's version to the file system.
-async fn save_version(target: Target, version: ModrinthModVersion) -> Result<(), reqwest::Error> {
+async fn save_version(target: Target, version: ModrinthModVersion, _mod: ModrinthModInfo) -> Result<(), reqwest::Error> {
     // Check if the mod doesn't exist.
     if version.files.len() < 1 {
-        println!("Skipped {}.", version.project_id);
+        println!("Skipped {} ({}).", _mod.title, version.project_id.unwrap_or("".to_string()));
         return Ok(());
     }
 
@@ -93,11 +135,14 @@ async fn save_version(target: Target, version: ModrinthModVersion) -> Result<(),
     }
 
     // Download the mod.
-    let bytes = reqwest::get(url).await?.bytes().await?;
+    let bytes = CLIENT.get(url)
+        .header(USER_AGENT, DEFAULT_AGENT.clone())
+        .send().await?.bytes().await?;
     // Save the mod to the target destination.
     fs::write(path, bytes).await
         .expect("Failed to save mod.");
 
+    println!("Downloaded {} ({}).", _mod.title, version.project_id.unwrap_or("".to_string()));
     Ok(())
 }
 
@@ -105,25 +150,25 @@ async fn save_version(target: Target, version: ModrinthModVersion) -> Result<(),
 /// No checks are performed.
 async fn download_unsafe(target: Target, _mod: String) -> Result<(), reqwest::Error> {
     // Get the mod's info.
-    let mod_info: ModrinthModInfo = serde_json::from_str(reqwest::get(
+    let mod_info: ModrinthModInfo = serde_json::from_str(make_request(
         mod_info(_mod.clone())
-    ).await?.text().await?.as_str()).unwrap();
+    ).await.unwrap().as_str()).unwrap();
 
     // Get the matching version.
     let version_info = pick_version(
         target.clone().target_version, mod_info.clone()).await;
 
     // Save the version to the file system.
-    Ok(save_version(target.clone(), version_info).await?)
+    Ok(save_version(target.clone(), version_info, mod_info).await?)
 }
 
 /// Downloads a mod from Modrinth.
 /// Checks for dependencies.
 pub async fn download(target: Target, _mod: String, is_server: bool) -> Result<bool, reqwest::Error> {
     // Get the mod's info.
-    let mod_info: ModrinthModInfo = serde_json::from_str(reqwest::get(
+    let mod_info: ModrinthModInfo = serde_json::from_str(make_request(
         mod_info(_mod.clone())
-    ).await?.text().await?.as_str()).unwrap();
+    ).await.unwrap().as_str()).unwrap();
 
     // Get the matching version.
     let version_info = pick_version(
@@ -153,5 +198,5 @@ pub async fn download(target: Target, _mod: String, is_server: bool) -> Result<b
     }
 
     // Save the version to the file system.
-    Ok(save_version(target.clone(), version_info).await.is_ok())
+    Ok(save_version(target.clone(), version_info, mod_info).await.is_ok())
 }

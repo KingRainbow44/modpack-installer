@@ -1,5 +1,6 @@
 #![feature(const_trait_impl)]
 
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use tokio::process::Command;
 
@@ -21,7 +22,8 @@ pub struct ModPackDescriptor {
 #[derive(Clone, Deserialize)]
 pub struct External {
     url: String,
-    file: String
+    file: String,
+    extract: Option<String>
 }
 
 #[derive(Clone)]
@@ -29,6 +31,10 @@ pub struct Target {
     file_path: String,
     target_version: String
 }
+
+// Create a global variable for the reqwest client.
+pub static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| reqwest::Client::new());
+pub static DEFAULT_AGENT: Lazy<String> = Lazy::new(|| "Magix-Archive/modpack-installer".to_string());
 
 #[tokio::main]
 async fn main() {
@@ -65,18 +71,27 @@ async fn main() {
     let decoded = serde_json::from_str::<ModPackDescriptor>(&file).unwrap();
     let modpack = decoded.clone();
 
-    // Check if Minecraft is installed.
-    let app_data = files::get_appdata().unwrap();
-    let versions_dir = format!("{}/{}/{}",
-                               app_data.to_str().unwrap(),
-                               ".minecraft", "versions");
-    let loader = format!("{}/{}", versions_dir, decoded.loader);
-    if !files::exists(&loader).await {
-        download_loader(modpack.clone()).await;
+    // Get the current directory.
+    let current_dir = std::env::current_dir().unwrap()
+        .to_str().unwrap().to_string();
+    let mut target_dir = current_dir.clone();
+
+    if !server {
+        // Check if Minecraft is installed.
+        let app_data = files::get_appdata().unwrap();
+        let versions_dir = format!("{}/{}/{}",
+                                   app_data.to_str().unwrap(),
+                                   ".minecraft", "versions");
+        target_dir = versions_dir.clone();
+
+        let loader = format!("{}/{}", versions_dir, decoded.loader);
+        if !files::exists(&loader).await {
+            download_loader(modpack.clone()).await;
+        }
     }
 
     // Check if the modpack is already installed.
-    let modpack_dir = format!("{}/{}", versions_dir, decoded.folder);
+    let modpack_dir = format!("{}/{}", target_dir, decoded.folder);
     if files::exists(&modpack_dir).await {
         // TODO: Update the modpack.
         println!("Modpack already installed.");
@@ -99,9 +114,66 @@ async fn main() {
         target_version: decoded.target.clone()
     };
 
-    // Download the mods to the target.
-    for _mod in decoded.mods {
-        modrinth::download(target.clone(), _mod, server).await.unwrap();
+    // Split the mods needed to download into 5 groups.
+    let mods = decoded.mods.clone();
+    let mut mods_1 = Vec::new();
+    let mut mods_2 = Vec::new();
+    let mut mods_3 = Vec::new();
+    let mut mods_4 = Vec::new();
+    let mut mods_5 = Vec::new();
+    for (i, _mod) in mods.iter().enumerate() {
+        if i % 5 == 0 {
+            mods_1.push(_mod.clone());
+        } else if i % 5 == 1 {
+            mods_2.push(_mod.clone());
+        } else if i % 5 == 2 {
+            mods_3.push(_mod.clone());
+        } else if i % 5 == 3 {
+            mods_4.push(_mod.clone());
+        } else if i % 5 == 4 {
+            mods_5.push(_mod.clone());
+        }
+    }
+
+    // Create 5 workers to download the mods.
+    let mut workers = Vec::new();
+    let target_w1 = target.clone();
+    let target_w2 = target.clone();
+    let target_w3 = target.clone();
+    let target_w4 = target.clone();
+    let target_w5 = target.clone();
+    // Download the mods.
+    workers.push(tokio::spawn(async move {
+        for _mod in mods_1 {
+            modrinth::download(target_w1.clone(), _mod, server).await.unwrap();
+        }
+    }));
+    workers.push(tokio::spawn(async move {
+        for _mod in mods_2 {
+            modrinth::download(target_w2.clone(), _mod, server).await.unwrap();
+        }
+    }));
+    workers.push(tokio::spawn(async move {
+        for _mod in mods_3 {
+            modrinth::download(target_w3.clone(), _mod, server).await.unwrap();
+        }
+    }));
+    workers.push(tokio::spawn(async move {
+        for _mod in mods_4 {
+            modrinth::download(target_w4.clone(), _mod, server).await.unwrap();
+        }
+    }));
+    workers.push(tokio::spawn(async move {
+        for _mod in mods_5 {
+            modrinth::download(target_w5.clone(), _mod, server).await.unwrap();
+        }
+    }));
+
+    // Wait for the workers to finish.
+    for worker in workers {
+        worker.await.unwrap_or_else(|error| {
+            println!("Failed to download mod. {}", error);
+        });
     }
 
     // Download the external mods.
@@ -115,13 +187,29 @@ async fn main() {
         }
 
         let path = format!("{}/{}", modpack_dir.clone(), external.file);
-        files::download(external.url, path).await.unwrap_or_else(|_| {
+        files::download(external.url, path.clone()).await.unwrap_or_else(|_| {
             println!("Failed to download {}.", external.file);
         });
+
+        println!("Downloaded {}.", external.file);
+
+        // Check if the file is a ZIP archive.
+        if external.file.ends_with(".zip") &&
+            external.extract.is_some() {
+            // Extract the archive to the target destination.
+            let destination = format!("{}/{}", modpack_dir.clone(), external.extract.unwrap());
+            files::extract_archive(path.clone(), destination);
+            // Delete the archive.
+            files::delete(path.as_str()).await;
+
+            println!("Extracted {}.", external.file);
+        }
     }
 
     // Create a Minecraft profile.
-    create_profile(modpack_dir.clone(), modpack).await;
+    if !server {
+        create_profile(modpack_dir.clone(), modpack).await;
+    }
 
     println!("Modpack installed.");
 }
